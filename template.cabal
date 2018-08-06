@@ -16,7 +16,7 @@ cabal-version:       >= 1.6
 extra-source-files:  examples/*.hs
 
 library
-  exposed-modules: Data.Text.Template
+  exposed-modules: Data.Text.Template, Data.Text.Template.Parse
   other-modules: Data.Text.Template.Internal
 
   build-depends:

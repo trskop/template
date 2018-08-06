@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE NamedFieldPuns #-}
 
 -- | Implementation module. Public API is documented in "Data.Text.Template".
 module Data.Text.Template.Internal
@@ -20,14 +21,24 @@ module Data.Text.Template.Internal
      -- * Applicative interface
      renderA,
      substituteA,
+
+     ParseOptions(..),
+     ParseError(..),
+     showTemplateError,
+     showParseError,
+     mkParseError,
+     parseError,
+     parse,
     ) where
 
 import Control.Applicative (Applicative(pure), (<$>))
+import Control.Exception (Exception, throw)
 import Control.Monad (liftM, liftM2, replicateM_)
 import Control.Monad.State.Strict (State, evalState, get, put)
+import Data.Bifunctor (bimap)
 import Data.Char (isAlphaNum, isLower)
 import Data.Function (on)
-import Data.Maybe (fromJust, isJust)
+import Data.Maybe (fromJust, isJust, listToMaybe)
 import Data.Monoid (Monoid(mempty, mappend))
 import Data.Traversable (traverse)
 import Prelude hiding (takeWhile)
@@ -37,6 +48,11 @@ import Data.Semigroup (Semigroup)
 import qualified Data.Semigroup as Semigroup
 #endif
 
+import Data.CallStack
+    ( HasCallStack
+    , SrcLoc(srcLocFile, srcLocStartLine)
+    , callStack
+    )
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as LT
 
@@ -108,16 +124,16 @@ type ContextA f = T.Text -> f T.Text
 -- Basic interface
 
 -- | Create a template from a template string.  A malformed template
--- string will raise an 'error'.
-template :: T.Text -> Template
-template = templateFromFrags . runParser pFrags
+-- string will raise a 'ParseError'.
+template :: HasCallStack => T.Text -> Template
+template = templateFromFrags . runParser (pFrags defaultParseOptions)
 
 -- | Create a template from a template string.  A malformed template
 -- string will cause 'templateSafe' to return @Left (row, col)@, where
 -- @row@ starts at 1 and @col@ at 0.
 templateSafe :: T.Text -> Either (Int, Int) Template
 templateSafe =
-    either Left (Right . templateFromFrags) . runParser pFragsSafe
+    fmap templateFromFrags . runParser (pFragsSafe defaultParseOptions)
 
 templateFromFrags :: [Frag] -> Template
 templateFromFrags = Template . combineLits
@@ -186,8 +202,11 @@ substituteA = renderA . template
 -- -----------------------------------------------------------------------------
 -- Template parser
 
-pFrags :: Parser [Frag]
-pFrags = do
+parse :: HasCallStack => ParseOptions -> T.Text -> Either ParseError Template
+parse opts = bimap mkParseError templateFromFrags . runParser (pFragsSafe opts)
+
+pFrags :: HasCallStack => ParseOptions -> Parser [Frag]
+pFrags opts = do
     c <- peek
     case c of
       Nothing  -> return []
@@ -195,13 +214,13 @@ pFrags = do
                      case c' of
                        Just '$' -> do discard 2
                                       continue (return $ Lit $ T.pack "$")
-                       _        -> continue pVar
+                       _        -> continue (pVar opts)
       _        -> continue pLit
   where
-    continue x = liftM2 (:) x pFrags
+    continue x = liftM2 (:) x (pFrags opts)
 
-pFragsSafe :: Parser (Either (Int, Int) [Frag])
-pFragsSafe = pFragsSafe' []
+pFragsSafe :: ParseOptions -> Parser (Either (Int, Int) [Frag])
+pFragsSafe opts = pFragsSafe' []
   where
     pFragsSafe' frags = do
         c <- peek
@@ -211,7 +230,7 @@ pFragsSafe = pFragsSafe' []
                          case c' of
                            Just '$' -> do discard 2
                                           continue (Lit $ T.pack "$")
-                           _        -> do e <- pVarSafe
+                           _        -> do e <- pVarSafe opts
                                           either abort continue e
           _        -> do l <- pLit
                          continue l
@@ -219,8 +238,8 @@ pFragsSafe = pFragsSafe' []
         continue x = pFragsSafe' (x : frags)
         abort      = return . Left
 
-pVar :: Parser Frag
-pVar = do
+pVar :: HasCallStack => ParseOptions -> Parser Frag
+pVar ParseOptions{bracketsRequired} = do
     discard 1
     c <- peek
     case c of
@@ -231,11 +250,13 @@ pVar = do
                        Just '}' -> do discard 1
                                       return $ Var v True
                        _        -> liftM parseError pos
-      _        -> do v <- pIdentifier
-                     return $ Var v False
 
-pVarSafe :: Parser (Either (Int, Int) Frag)
-pVarSafe = do
+      _ | bracketsRequired -> parseError <$> pos
+        | otherwise        -> do v <- pIdentifier
+                                 return $ Var v False
+
+pVarSafe :: ParseOptions -> Parser (Either (Int, Int) Frag)
+pVarSafe ParseOptions{bracketsRequired} = do
     discard 1
     c <- peek
     case c of
@@ -248,10 +269,12 @@ pVarSafe = do
                                                       return $ Right (Var v True)
                                        _        -> liftM parseErrorSafe pos
                        Left m  -> return $ Left m
-      _        -> do e <- pIdentifierSafe
-                     return $ either Left (\v -> Right $ Var v False) e
 
-pIdentifier :: Parser T.Text
+      _ | bracketsRequired -> parseErrorSafe <$> pos
+        | otherwise        -> do e <- pIdentifierSafe
+                                 return $ (\v -> Var v False) <$> e
+
+pIdentifier :: HasCallStack => Parser T.Text
 pIdentifier = do
     m <- peek
     if isJust m && isIdentifier0 (fromJust m)
@@ -276,16 +299,62 @@ isIdentifier0 c = or [isLower c, c == '_']
 isIdentifier1 :: Char -> Bool
 isIdentifier1 c = or [isAlphaNum c, c `elem` "_'"]
 
-parseError :: (Int, Int) -> a
-parseError = error . makeParseErrorMessage
+-- -----------------------------------------------------------------------------
+-- Parse Options
+
+newtype ParseOptions = ParseOptions
+    { bracketsRequired :: Bool
+    }
+  deriving Show
+
+-- |
+-- @
+-- 'bracketsRequired' = False
+-- @
+defaultParseOptions :: ParseOptions
+defaultParseOptions = ParseOptions
+    { bracketsRequired = False
+    }
+
+-- -----------------------------------------------------------------------------
+-- Parse Error
+
+data ParseError = ParseError
+    { sourceLocation :: Maybe SrcLoc
+    , templateLocation :: (Int, Int)
+    }
+
+instance Show ParseError where
+    showsPrec _ = showParseError
+
+instance Exception ParseError
+
+mkParseError :: HasCallStack => (Int, Int) -> ParseError
+mkParseError templateLocation = ParseError {sourceLocation, templateLocation}
+  where
+    sourceLocation :: Maybe SrcLoc
+    sourceLocation = snd <$> listToMaybe (reverse callStack)
+
+showParseError :: ParseError -> ShowS
+showParseError ParseError{sourceLocation, templateLocation} =
+    showLocation sourceLocation . showTemplateError templateLocation
+  where
+    showLocation :: Maybe SrcLoc -> ShowS
+    showLocation = maybe id $ \loc ->
+        showString (srcLocFile loc) . showChar ':'
+        . shows (srcLocStartLine loc) . showString ":\n"
+
+-- | Render template error position as an error message.
+showTemplateError :: (Int, Int) -> ShowS
+showTemplateError (row, col) =
+    showString "Invalid placeholder at row " . shows row
+    . showString ", col " . shows col
+
+parseError :: HasCallStack => (Int, Int) -> a
+parseError = throw . mkParseError
 
 parseErrorSafe :: (Int, Int) -> Either (Int, Int) a
 parseErrorSafe = Left
-
-makeParseErrorMessage :: (Int, Int) -> String
-makeParseErrorMessage (row, col) =
-    "Invalid placeholder at " ++
-    "row " ++ show row ++ ", col " ++ show col
 
 -- -----------------------------------------------------------------------------
 -- Text parser

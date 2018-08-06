@@ -43,6 +43,11 @@ module Data.Text.Template
      renderA,
      substituteA,
 
+     -- * Parse Error
+     ParseError(..),
+     showParseError,
+     showTemplateError,
+
      -- * Example
      -- $example
     ) where
@@ -50,10 +55,13 @@ module Data.Text.Template
 import Data.Text.Template.Internal
     ( Context
     , ContextA
+    , ParseError(..)
     , Template
     , render
     , renderA
+    , showParseError
     , showTemplate
+    , showTemplateError
     , substitute
     , substituteA
     , template
