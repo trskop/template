@@ -16,10 +16,12 @@ cabal-version:       >= 1.6
 extra-source-files:  examples/*.hs
 
 library
-  exposed-modules:  Data.Text.Template
+  exposed-modules: Data.Text.Template
+  other-modules: Data.Text.Template.Internal
 
   build-depends:
     base >= 3.0 && < 5,
+    call-stack == 0.1.*,
     mtl >= 1.1 && < 2.3,
     text >= 0.7.2 && < 1.3
 
